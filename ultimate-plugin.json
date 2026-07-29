@@ -1,0 +1,80 @@
+{
+  "protocol_version": "1.0",
+  "plugin": {
+    "id": "video.hanime1",
+    "name": "Hanime1",
+    "version": "0.1.0",
+    "entrypoint": "./ultimate_provider.py:Hanime1Provider",
+    "config_key": "hanime1"
+  },
+  "media_types": ["video"],
+  "identity": {
+    "content_type": "video",
+    "host_id_prefix": "HN1",
+    "platform_label": "Hanime1",
+    "aliases": ["hanime1", "hn1"]
+  },
+  "presentation": {
+    "media_card": {
+      "cover": {
+        "aspect_ratio": "16 / 9",
+        "fit": "cover"
+      },
+      "badge": {
+        "show_platform_label": true,
+        "label": "Hanime1"
+      }
+    }
+  },
+  "capabilities": [
+    { "key": "catalog.search" },
+    { "key": "catalog.detail" },
+    { "key": "playback.proxy.url" },
+    { "key": "playback.proxy.stream" },
+    { "key": "playback.sources.build" },
+    { "key": "transport.http.request" },
+    { "key": "health.query.status" }
+  ],
+  "configuration": {
+    "order": 45,
+    "label": "Hanime1",
+    "sections": [
+      {
+        "id": "basic",
+        "label": "基础配置",
+        "fields": [
+          { "key": "enabled", "label": "启用", "type": "boolean" },
+          { "key": "domain", "label": "站点域名", "type": "text", "placeholder": "https://hanime1.me" },
+          { "key": "timeout_seconds", "label": "请求超时秒数", "type": "number", "placeholder": "30" },
+          { "key": "proxy", "label": "HTTP 代理", "type": "text", "placeholder": "http://127.0.0.1:7890" }
+        ]
+      }
+    ]
+  },
+  "resource_policy": {
+    "assets": {
+      "image": {
+        "available": true,
+        "download_enabled": true,
+        "request_profiles": [
+          {
+            "match_hosts": ["vdownload.hembed.com", "vdownload-7.hembed.com", "hanime1.me"],
+            "referer": "https://hanime1.me/",
+            "proxy_mode": "frontend"
+          }
+        ]
+      },
+      "cover": {
+        "available": true,
+        "download_enabled": true,
+        "request_profiles": [
+          {
+            "match_hosts": ["vdownload.hembed.com", "vdownload-7.hembed.com", "hanime1.me"],
+            "referer": "https://hanime1.me/",
+            "proxy_mode": "frontend"
+          }
+        ]
+      }
+    }
+  }
+}
