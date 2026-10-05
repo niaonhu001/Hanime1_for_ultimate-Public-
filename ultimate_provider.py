@@ -30,7 +30,67 @@ DEFAULT_USER_AGENT = (
     "Chrome/120.0.0.0 Safari/537.36"
 )
 
-_TOKEN_MASK_VALUES = {"", "********", "******", "__KEEP__"}
+SUPPORTED_CAPABILITIES = frozenset(
+    {
+        "catalog.search",
+        "catalog.detail",
+        "playback.proxy.url",
+        "playback.proxy.stream",
+        "playback.sources.build",
+        "transport.http.request",
+        "health.query.status",
+    }
+)
+
+_HTML_PARSERS = ("lxml", "html.parser")
+
+
+def _make_soup(html: Any) -> BeautifulSoup:
+    """优先 lxml，缺失时回退标准库解析器（Android/Chaquopy 环境更稳）。"""
+    for parser in _HTML_PARSERS:
+        try:
+            return BeautifulSoup(html, parser)
+        except Exception:
+            continue
+    return BeautifulSoup(html, "html.parser")
+
+
+class _ProxyResponse:
+    """把第三方响应包装成宿主消费的形态。
+
+    - ``/api/v1/video/proxy/<domain>/<path>`` 读 ``.body`` / ``.status_code`` / ``.headers``
+    - ``/api/v1/video/proxy2`` 走 ``.iter_content`` 流式转发
+    """
+
+    def __init__(self, response: Any):
+        self._response = response
+
+    @property
+    def body(self) -> bytes:
+        return self._response.content
+
+    @property
+    def content(self) -> bytes:
+        return self._response.content
+
+    @property
+    def status_code(self) -> int:
+        return int(getattr(self._response, "status_code", 0) or 0)
+
+    @property
+    def headers(self):
+        return getattr(self._response, "headers", {}) or {}
+
+    def iter_content(self, chunk_size: int = 262144):
+        return self._response.iter_content(chunk_size=chunk_size)
+
+    def close(self) -> None:
+        close = getattr(self._response, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
 
 
 def _as_bool(value: Any, default: bool = False) -> bool:
@@ -101,7 +161,7 @@ class Hanime1Provider(ProtocolProvider):
     def normalize_config(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         raw = dict(payload or {})
         normalized: Dict[str, Any] = {}
-        normalized["enabled"] = _as_bool(raw.get("enabled"), True)
+        normalized["enabled"] = _as_bool(raw.get("enabled"), False)
         normalized["domain"] = _normalize_domain(raw.get("domain"))
         normalized["timeout_seconds"] = _as_int(
             raw.get("timeout_seconds"), DEFAULT_TIMEOUT_SECONDS, 1, 600
@@ -119,13 +179,11 @@ class Hanime1Provider(ProtocolProvider):
         public["proxy_configured"] = bool(
             str((config or {}).get("proxy") or "").strip()
         )
-        # 标记字段类型，让 UI 知道它不是秘密字段
-        public["_proxy_field_type"] = "text"
         return public
 
     def get_query_status(self, config: Dict[str, Any]) -> Dict[str, Any]:
         normalized = self.normalize_config(config)
-        enabled = _as_bool(normalized.get("enabled"), True)
+        enabled = _as_bool(normalized.get("enabled"), False)
         domain = str(normalized.get("domain") or "").strip()
         configured = bool(enabled and domain)
         return {
@@ -228,6 +286,19 @@ class Hanime1Provider(ProtocolProvider):
 
     # ---------- 能力入口 ----------
 
+    def _declared_capabilities(self) -> set:
+        """以清单声明为准；清单缺少 capabilities 时回退到代码内置能力集。"""
+        raw = None
+        if isinstance(self.manifest, dict):
+            raw = self.manifest.get("capabilities")
+        declared = {
+            str((item or {}).get("key") or "").strip()
+            for item in (raw or [])
+            if isinstance(item, dict)
+        }
+        declared.discard("")
+        return declared or set(SUPPORTED_CAPABILITIES)
+
     def execute(
         self,
         capability: str,
@@ -236,11 +307,14 @@ class Hanime1Provider(ProtocolProvider):
         config: Dict[str, Any],
     ) -> Any:
         normalized = self.normalize_config(config)
-        if not _as_bool(normalized.get("enabled"), True):
-            raise RuntimeError("Hanime1 插件未启用。")
+        if capability not in self._declared_capabilities():
+            raise ValueError(f"不支持的能力: {capability}")
 
         if capability == "health.query.status":
             return self.get_query_status(config)
+
+        if not _as_bool(normalized.get("enabled"), False):
+            raise RuntimeError("Hanime1 插件未启用。")
 
         session = self._build_session(normalized)
 
@@ -387,27 +461,56 @@ class Hanime1Provider(ProtocolProvider):
                 return response
             raise
 
-    def _handle_proxy_stream(
-        self,
-        session: std_requests.Session,
-        config: Dict[str, Any],
-        params: Dict[str, Any],
-    ):
-        """处理 playback.proxy.stream — 代理流式请求（视频）。"""
-        method = str(params.get("method") or "GET").upper()
-        query_string = str(params.get("query_string") or "").strip()
-        body_url = str(params.get("body_url") or "").strip()
+    @staticmethod
+    def _strip_host_prefix(value: str) -> str:
+        """宿主可能传入 HN1<id> 形式的 ID，这里还原为站内 ID。"""
+        text = str(value or "").strip()
+        prefix = HANIME1_HOST_ID_PREFIX
+        if text.upper().startswith(prefix) and len(text) > len(prefix):
+            stripped = text[len(prefix):].strip("_- ")
+            if stripped:
+                return stripped
+        return text
 
-        target_url = body_url
-        if not target_url and query_string:
+    @staticmethod
+    def _resolve_proxy_target(params: Dict[str, Any]) -> str:
+        """按协议优先用 body_url / query_string，其次用 domain + path 拼装目标 URL。"""
+        body_url = str(params.get("body_url") or "").strip()
+        if body_url:
+            return body_url
+
+        query_string = str(params.get("query_string") or "").strip()
+        if query_string:
             parsed = parse_qs(query_string)
             url_param = parsed.get("url", [])
             if url_param:
                 encoded = url_param[0]
                 try:
-                    target_url = base64.b64decode(encoded).decode("utf-8")
+                    return base64.b64decode(encoded).decode("utf-8")
                 except Exception:
-                    target_url = encoded
+                    return encoded
+
+        domain = str(params.get("domain") or "").strip()
+        path = str(params.get("path") or "").strip()
+        if not domain:
+            return ""
+        base = domain if domain.startswith(("http://", "https://")) else f"https://{domain}"
+        target = f"{base.rstrip('/')}/{path.lstrip('/')}" if path else base.rstrip("/")
+        return f"{target}?{query_string}" if query_string else target
+
+    def _handle_proxy_stream(
+        self,
+        session: std_requests.Session,
+        config: Dict[str, Any],
+        params: Dict[str, Any],
+    ) -> _ProxyResponse:
+        """处理 playback.proxy.stream — 代理宿主的 /proxy/<domain>/<path> 路由。
+
+        宿主按 ``proxy_result.body / .status_code / .headers`` 消费该结果，
+        因此返回 _ProxyResponse 包装对象，而不是裸的 requests.Response。
+        """
+        method = str(params.get("method") or "GET").upper()
+        target_url = self._resolve_proxy_target(params)
 
         if not target_url:
             raise ValueError("proxy.stream: missing target URL")
@@ -418,13 +521,14 @@ class Hanime1Provider(ProtocolProvider):
 
         req_headers = {"Referer": "https://hanime1.me/"}
         try:
-            response = session.get(
+            response = session.request(
+                method,
                 target_url,
                 headers=req_headers,
                 timeout=timeout,
                 stream=True,
             )
-            return response
+            return _ProxyResponse(response)
         except Exception:
             # 如果有代理配置但失败，回退到无代理
             has_proxy = bool(str(config.get("proxy") or "").strip())
@@ -432,16 +536,17 @@ class Hanime1Provider(ProtocolProvider):
                 no_proxy_config = dict(config)
                 no_proxy_config["proxy"] = ""
                 fallback_session = self._build_session(no_proxy_config)
-                response = fallback_session.get(
+                response = fallback_session.request(
+                    method,
                     target_url,
                     headers=req_headers,
                     timeout=timeout,
                     stream=True,
                 )
-                return response
+                return _ProxyResponse(response)
             raise
 
-    def _to_proxy_video_url(self, src_url: str) -> str:
+    def _to_proxy_video_url(self, src_url: str, proxy_base_path: str = "") -> str:
         """将 CDN 视频 URL 包装为后端代理 URL。
 
         hanime1 的视频文件托管在 vdownload.hembed.com CDN，
@@ -453,8 +558,9 @@ class Hanime1Provider(ProtocolProvider):
         if "hembed.com" not in src_url.lower() and "hanime1.me" not in src_url.lower():
             return src_url
         try:
+            base = (proxy_base_path or "/api/v1/video").rstrip("/")
             encoded = base64.b64encode(src_url.encode("utf-8")).decode("utf-8")
-            return f"/api/v1/video/proxy2?url={encoded}"
+            return f"{base}/proxy2?url={encoded}"
         except Exception:
             return src_url
 
@@ -472,12 +578,13 @@ class Hanime1Provider(ProtocolProvider):
         注意：视频源 URL 通过代理包装，避免浏览器因 CORS/Referer
         限制无法直接加载 vdownload.hembed.com CDN 资源。
         """
-        code = str(params.get("code") or "").strip()
+        code = str(params.get("code") or params.get("video_id") or "").strip()
         if not code:
             return []
+        video_id = self._strip_host_prefix(code)
 
         # 复用详情页解析获取视频源
-        detail_result = self._handle_detail(session, config, {"video_id": code})
+        detail_result = self._handle_detail(session, config, {"video_id": video_id})
         videos = detail_result.get("videos", [])
         if not videos:
             return []
@@ -499,7 +606,9 @@ class Hanime1Provider(ProtocolProvider):
                 resolution_label = "原始"
 
             # 将 CDN URL 包装为代理 URL，解决浏览器跨域问题
-            proxy_url = self._to_proxy_video_url(src_url)
+            proxy_url = self._to_proxy_video_url(
+                src_url, str(params.get("proxy_base_path") or "")
+            )
 
             sources.append({
                 "key": f"hanime1_{i}",
@@ -574,7 +683,7 @@ class Hanime1Provider(ProtocolProvider):
         self, html: str, domain: str
     ) -> tuple[List[Dict[str, Any]], int]:
         """解析搜索结果的 HTML，返回 (video列表, 总页数)。"""
-        soup = BeautifulSoup(html, "lxml")
+        soup = _make_soup(html)
         results: List[Dict[str, Any]] = []
 
         # 搜索结果结构:
@@ -665,7 +774,7 @@ class Hanime1Provider(ProtocolProvider):
         self, html: str, video_id: str, domain: str
     ) -> Optional[Dict[str, Any]]:
         """解析视频详情页 HTML。"""
-        soup = BeautifulSoup(html, "lxml")
+        soup = _make_soup(html)
 
         # ====== 标题 ======
         title = ""
